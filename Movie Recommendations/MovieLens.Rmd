@@ -1,0 +1,255 @@
+---
+title: "Report on Movie Recommendations"
+author: "Abigail Motley"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r script, include=FALSE}
+source("MovieLens.R")
+```
+
+## Overview
+The goal of this report is to generate a machine learning model to recommend movies to users by predicting the rating a user would give a particular movie. We will use the 10M version of the `MovieLens` dataset to build and validate the model. First, we will clean and split the data into our training and final validation sets. Next, we'll analyze the data and use that insight to build and test intermediary models. Finally, we'll choose the best model to run our validation set on. Our final model is linear and has an RMSE of 0.8644514 on the validation set.
+
+## Analysis
+### Preparing the Data
+The `MovieLens` dataset from `http://files.grouplens.org/datasets/movielens/ml-10m.zip` is split into two separate .dat files called `ratings` and `movies`. We need to download the data from both files, convert each into a dataframe in R, add column names (Movie, User, Genre, Timestamp, and Rating), convert the data into the appropriate type (character, numeric, etc), and finally join them together into a single dataframe.
+
+Next, we need to split our data into our test and final validation sets called `edx` and `validation`. The `edx` set will be used to explore our data and create intermediary models. The `validation` set will only be used at the end to test our best model. In this case, we create a partition where 10% of the data is used for the `validation` set. We are careful to ensure that the userIds and movieIds that appear in the `validation` set are also in the `edx` set.
+
+We now have `edx` and `validation` sets:
+```{r edxValidation}
+dim(edx)
+dim(validation)
+```
+
+Finally, we want to split the `edx` dataset into two separate `train` and `test` subsets that can be used for intermediate RMSE validation. We use 10% of the `edx` data for the `test` set, and again ensure that the userIds and movieIds that appear in the `test` set are also in the `train` set.
+```{r trainTest}
+dim(train)
+dim(test)
+```
+
+Now that we've prepared our data, we will explore the properties of various predictors and decide how to use them to create our prediction model. Potential preditors are: Movie, User, Genre, and Timestamp.
+
+### Movie Effect
+To see if the movie may be an interesting predictor for our model, let's plot the average movie ratings.
+```{r avgMovieRating, echo=FALSE}
+average_movie_rating
+```
+Since the results have some variety, it seems like movies will be a useful predictor to add to our model.
+
+We can use a linear model which considers the movie in the prediction: `Y_u,i = mu + b_i + epsilon_u,i`. `mu` is the true rating for all movies, which we can estimate using the mean. `b_i` is the movie effect, or the average ranking for movie i. `epsilon` represents the error. Since running R's `lm` function will be too slow due to the size of the dataset, we can instead estimate `b_i` by using `Y_u,i - mu` for each movie i.
+```{r estimateBi}
+mu <- mean(train$rating) 
+b_i_estimates <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+```
+
+Let's create the model using the b_i_estimates.
+```{r movieEffectModel}
+movie_effect_model <- mu + test %>% 
+  left_join(b_i_estimates, by='movieId') %>%
+  pull(b_i)
+```
+
+Find the RMSE of the model using the `test` set. Note we are not using the `validation` set since this will only be used to measure the performance of our final model.
+```{r rmseMovie}
+rmse_movie <- RMSE(movie_effect_model, test$rating)
+rmse_movie
+```
+
+Let's explore what our model is estimating and see if we can do better. Let's look at the top 10 and bottom 10 rated movies.
+```{r top10Movies}
+top_10_movies
+bottom_10_movies
+```
+We notice our model's top 10 best and worst rated movies are not very well-known.
+Let's see how many ratings each of these movies have.
+```{r top10MoviesCountRated}
+top_10_movie_count_rated
+bottom_10_movie_count_rated
+```
+It looks like most of the movies in the top and bottom 10 don't have a lot of users who rated them.
+
+In general, we can also see that a lot of movies have very few ratings.
+```{r numberOfRatingsPerMovie}
+edx %>% 
+  group_by(movieId) %>% 
+  summarize(numRatings=n()) %>%
+  filter(numRatings < 25) %>%
+  summarize(moviesWithLessThan25Ratings = n())
+```
+Since we know predictions made with a low number of data points tend to be less accurate, we should give these estimates less weight in our model. To reduce the effect of these predictions made with small data points, we can use regularization. We will need to add a penalty lambda to our estimate of b_i: `b_i_regularized = sum(ratings - mu)/(lambda + count_ratings)`.
+
+To choose the right value of lambda, we can use cross valdation.
+```{r cv}
+lambdas <- seq(0, 10, 0.25)
+rmses_for_different_lambdas <- sapply(lambdas, function(l){
+  mu <- mean(train$rating)
+  b_i <- train %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating-mu)/(n()+l))
+  movie_effect_model_reg <- test %>% 
+    left_join(b_i, by='movieId') %>% 
+    mutate(pred = mu + b_i) %>%
+    pull(pred)
+  return(RMSE(movie_effect_model_reg, test$rating))
+})
+qplot(lambdas, rmses_for_different_lambdas)
+best_lambda <- lambdas[which.min(rmses_for_different_lambdas)]
+best_lambda
+```
+
+Let's create the model using the regularized b_i_estimates and the best lambda.
+```{r movieReg}
+b_i_estimates_reg <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+best_lambda), n_i = n())
+movie_effect_model_reg <- test %>% 
+  left_join(b_i_estimates_reg, by='movieId') %>% 
+  mutate(pred = mu + b_i) %>%
+  pull(pred)
+```
+
+The RMSE of this model is 0.942937, which is slightly better than before.
+```{r rmseMovieReg}
+rmse_movie
+```
+
+Let's see if our top 10 and bottom 10 movies makes more sense after regularization.
+```{r top10MoviesReg}
+top_10_movies_reg
+bottom_10_movies_reg
+```
+These movies make a lot more sense.
+
+Next, let's explore the users.
+
+### User Effect
+To see if the user may be an interesting preditor for our model, let's plot the average user ratings.
+```{r avgUserRating, echo=FALSE}
+average_user_rating
+```
+Since the results have some variety, it seems like user will be a useful predictor to add to our model.
+
+Our modified model is: `Y_u,i = mu + b_i + b_u + epsilon_u,i`. `b_u` is the user effect, or the average ranking for user u. This is estimated by `Y_u,i - mu - b_i` for each user u. Remember that last time we had to use regularization because there were movie that didn't have many ratings.
+Let's see if we need to regularize users as well.
+```{r numberOfRatingsPerUser}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(numRatings=n()) %>%
+  filter(numRatings < 25) %>%
+  summarize(usersWithLessThan25Ratings = n())
+```
+We can see that several users hardly rated any movies, so we'll need to use regularization again: `b_u_regularized = sum(ratings - mu - b_i)/(lambda + count_ratings)`
+
+Let's create the model using the regularized b_i_estimates, b_u_estimates, and the best lambda.
+```{r movieUserEffectModelReg}
+b_i_estimates_reg <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+best_lambda), n_i = n())
+b_u_estimates_reg <- train %>%
+  left_join(b_i_estimates_reg, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u=sum(rating-b_i-mu)/(n()+best_lambda))
+movie_user_effect_model_reg <- test %>% 
+  left_join(b_i_estimates_reg, by='movieId') %>% 
+  left_join(b_u_estimates_reg, by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+```
+
+The RMSE of this model is 0.8641362, which is a big improvement.
+```{r rmseMovieUserReg}
+rmse_movie_user_reg
+```
+
+Next, let's explore the genres.
+
+### Genre Effect
+To see if the genre may be an interesting preditor for our model, let's plot the average genre ratings.
+```{r avgGenreRating, echo=FALSE}
+average_genre_rating
+```
+Since the results have some variety, it seems like genre will be a useful predictor to add to our model.
+
+Our modified model is: `Y_u,i = mu + b_i + b_u + b_g epsilon_u,i`. `b_g` is the genre effect, or the average ranking for genre g. It can be estimated by `Y_u,i - mu - b_i - b_u` for each genre g. Let's see if we need to regularize genres.
+```{r numberOfRatingsPerGenre}
+edx %>% 
+  group_by(genres) %>% 
+  summarize(numRatings=n()) %>%
+  filter(numRatings < 25) %>%
+  summarize(genresWithLessThan25Ratings = n())
+```
+We can see that some genres don't have many ratings, so let's regularize:
+`b_g_regularized = sum(ratings - mu - b_i - b_u)/(lambda + count_ratings)`
+
+Let's create the model using the regularized b_i_estimates, b_u_estimates, and the best lambda (4.75).
+```{r movieUserGenreEffectModelReg}
+b_i_estimates_reg <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+best_lambda), n_i = n())
+b_u_estimates_reg <- train %>%
+  left_join(b_i_estimates_reg, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u=sum(rating-b_i-mu)/(n()+best_lambda))
+b_g_estimates_reg <- train %>%
+  left_join(b_i_estimates_reg, by='movieId') %>% 
+  left_join(b_u_estimates_reg, by='userId') %>% 
+  group_by(genres) %>%
+  summarize(b_g=sum(rating-b_i-b_u-mu)/(n()+best_lambda))
+movie_user_genre_effect_model_reg <- test %>% 
+  left_join(b_i_estimates_reg, by='movieId') %>% 
+  left_join(b_u_estimates_reg, by='userId') %>% 
+  left_join(b_g_estimates_reg, by='genres') %>% 
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  pull(pred)
+```
+
+The RMSE of this model is 0.8638141, which is a slight improvement.
+```{r rmseMovieUserGenreReg}
+rmse_movie_user_genres_reg
+```
+
+We have some pretty good models, so let's move on to the results.
+
+## Results
+Here are the intermediate RMSEs of the models:
+```{r rmseChart, echo=FALSE}
+rmse_results <- tibble(method = c("Movie Effect Model", "Regularized Movie Effect Model", "Regularized Movie + User Effect Model", "Regularized Movie + User + Genre Effect Model"),
+                       RMSE = c(round(rmse_movie, digits=4), round(rmse_movie_reg, digits=4), round(rmse_movie_user_reg, digits=4), round(rmse_movie_user_genres_reg, digits=4)))
+rmse_results
+```
+
+Let's Choose the best model, "Regularized Movie + User + Genre Effect Model", run it on validation set to find our final RMSE.
+```{r finalRMSE}
+b_i_estimates_reg <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+best_lambda), n_i = n())
+b_u_estimates_reg <- edx %>%
+  left_join(b_i_estimates_reg, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u=sum(rating-b_i-mu)/(n()+best_lambda))
+b_g_estimates_reg <- edx %>%
+  left_join(b_i_estimates_reg, by="movieId") %>%
+  left_join(b_u_estimates_reg, by="userId") %>%
+  group_by(genres) %>%
+  summarize(b_g=sum(rating-b_i-b_u-mu)/(n()+best_lambda))
+movie_user_genre_effect_model_reg <- validation %>% 
+  left_join(b_i_estimates_reg, by='movieId') %>% 
+  left_join(b_u_estimates_reg, by='userId') %>% 
+  left_join(b_g_estimates_reg, by='genres') %>% 
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  pull(pred)
+final_rmse <- RMSE(movie_user_genre_effect_model_reg, validation$rating)
+final_rmse
+```
+The final RMSE of the validation set is 0.8644514.
+
+## Conclusion
+To summarize, we've shown how to build a movie recommendation system using the `MovieLens` dataset. This process included data cleaning, data analysis to guide the model building, and evaluating and selecting the best model. In the end, we were able to build a linear model that performs with a RMSE of 0.8644514.
